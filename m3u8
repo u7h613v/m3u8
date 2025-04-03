@@ -1,0 +1,659 @@
+import tkinter as tk
+from tkinter import scrolledtext, messagebox, ttk, simpledialog
+import threading
+import selenium.webdriver as webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+import time
+import re
+import json
+import requests
+import os
+import io
+import sys
+
+# Redirect stdout to capture print statements
+class TextRedirector:
+    def __init__(self, text_widget):
+        self.text_widget = text_widget
+        self.buffer = ""
+
+    def write(self, string):
+        self.buffer += string
+        self.text_widget.configure(state="normal")
+        self.text_widget.insert(tk.END, string)
+        self.text_widget.see(tk.END)
+        self.text_widget.configure(state="disabled")
+        
+    def flush(self):
+        pass
+
+class KickStreamerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Kick.com Stream Extractor")
+        self.root.geometry("800x600")
+        self.root.minsize(600, 500)
+        
+        # Configure the grid layout
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(1, weight=1)
+        
+        # Create a frame for input
+        input_frame = tk.Frame(root, padx=10, pady=10)
+        input_frame.grid(row=0, column=0, sticky="ew")
+        input_frame.columnconfigure(1, weight=1)
+        
+        # Channel name input
+        tk.Label(input_frame, text="Channel Name:").grid(row=0, column=0, sticky="w", padx=(0, 5))
+        self.channel_entry = tk.Entry(input_frame)
+        self.channel_entry.grid(row=0, column=1, sticky="ew", padx=5)
+        
+        # Add extract button
+        self.extract_button = tk.Button(input_frame, text="Extract Stream", command=self.start_extraction)
+        self.extract_button.grid(row=0, column=2, padx=5)
+        
+        # Add open VLC button
+        self.vlc_button = tk.Button(input_frame, text="Open in VLC", command=self.open_in_vlc, state="disabled")
+        self.vlc_button.grid(row=0, column=3, padx=5)
+        
+        # Create a frame for the log output
+        log_frame = tk.Frame(root)
+        log_frame.grid(row=1, column=0, sticky="nsew", padx=10, pady=10)
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        
+        # Add a scrolled text widget for logs
+        self.log_text = scrolledtext.ScrolledText(log_frame, wrap=tk.WORD, bg="#f0f0f0")
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        self.log_text.configure(state="disabled")
+        
+        # Create a status bar
+        self.status_var = tk.StringVar()
+        self.status_var.set("Ready")
+        self.status_bar = tk.Label(root, textvariable=self.status_var, bd=1, relief=tk.SUNKEN, anchor=tk.W)
+        self.status_bar.grid(row=2, column=0, sticky="ew")
+        
+        # Instance variables
+        self.m3u8_url = None
+        self.master_filename = None
+        self.is_extracting = False
+        
+        # Redirect stdout to the text widget
+        self.old_stdout = sys.stdout
+        sys.stdout = TextRedirector(self.log_text)
+        
+        # Protocol handler for closing the app properly
+        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+    
+    def start_extraction(self):
+        if self.is_extracting:
+            messagebox.showinfo("Extraction in progress", "Please wait for the current extraction to complete.")
+            return
+            
+        channel_name = self.channel_entry.get().strip()
+        if not channel_name:
+            messagebox.showerror("Error", "Please enter a channel name.")
+            return
+            
+        self.is_extracting = True
+        self.extract_button.config(state="disabled")
+        self.vlc_button.config(state="disabled")
+        
+        self.status_var.set("Extracting stream...")
+        
+        # Run the extraction in a separate thread to keep the GUI responsive
+        threading.Thread(target=self.extract_stream, args=(channel_name,), daemon=True).start()
+    
+    def extract_stream(self, channel_name):
+        # Clear the log before starting
+        self.log_text.configure(state="normal")
+        self.log_text.delete(1.0, tk.END)
+        self.log_text.configure(state="disabled")
+        
+        try:
+            result_url = extract_m3u8(channel_name, gui_callback=self.update_status)
+            
+            if result_url:
+                # Set the URL in a thread-safe way
+                self.root.after(0, lambda: self.set_extracted_url(result_url, channel_name))
+            else:
+                self.status_var.set("Failed to extract stream. See log for details.")
+                self.root.after(0, lambda: self.extract_button.config(state="normal"))
+        except Exception as e:
+            print(f"Error during extraction: {e}")
+            self.status_var.set(f"Error: {str(e)}")
+            self.root.after(0, lambda: self.extract_button.config(state="normal"))
+        finally:
+            self.is_extracting = False
+    
+    def set_extracted_url(self, url, channel_name):
+        """Update the URL and related GUI elements in a thread-safe way"""
+        self.m3u8_url = url
+        self.master_filename = f"{channel_name}_master.m3u8"
+        self.status_var.set(f"Stream extracted successfully: {self.master_filename}")
+        self.extract_button.config(state="normal")
+        self.vlc_button.config(state="normal")
+    
+    def update_status(self, message):
+        self.status_var.set(message)
+    
+    def open_in_vlc(self):
+        if not self.master_filename:
+            messagebox.showerror("Error", "No stream file available. Extract a stream first.")
+            return
+            
+        try:
+            if os.path.exists(self.master_filename):
+                # Use absolute path for the file
+                file_path = os.path.abspath(self.master_filename)
+                print(f"Opening {file_path} in VLC...")
+                
+                # Try to open with VLC
+                os.system(f'start vlc "{file_path}"')
+            else:
+                print(f"File {self.master_filename} not found")
+                messagebox.showerror("Error", f"File {self.master_filename} not found")
+                
+        except Exception as e:
+            print(f"Error opening VLC: {e}")
+            messagebox.showerror("Error", f"Failed to open VLC: {str(e)}")
+    
+    def on_closing(self):
+        # Restore stdout
+        sys.stdout = self.old_stdout
+        self.root.destroy()
+
+def save_log(channel_name, log_data):
+    """Helper function to save log data to a file"""
+    log_file_path = f"{channel_name}_extraction_log.txt"
+    with open(log_file_path, 'w') as f:
+        f.write("\n".join(log_data))
+
+def find_m3u8_urls(driver):
+    """Helper function to find m3u8 URLs using various methods"""
+    urls = []
+    
+    # Method 1: Check network requests
+    try:
+        network_urls = driver.execute_script("""
+            var result = [];
+            var entries = performance.getEntries();
+            for (var i = 0; i < entries.length; i++) {
+                var entry = entries[i];
+                if (entry.name && entry.name.indexOf('.m3u8') >= 0) {
+                    result.push(entry.name);
+                }
+            }
+            return result;
+        """)
+        urls.extend(network_urls)
+    except:
+        pass
+    
+    # Method 2: Check KICK_PRELOADED_STATE
+    try:
+        js_state_url = driver.execute_script("""
+            if (window.__KICK_PRELOADED_STATE__ && 
+                window.__KICK_PRELOADED_STATE__.channel && 
+                window.__KICK_PRELOADED_STATE__.channel.livestream) {
+                if (window.__KICK_PRELOADED_STATE__.channel.livestream.playback_url) {
+                    return window.__KICK_PRELOADED_STATE__.channel.livestream.playback_url;
+                }
+            }
+            return null;
+        """)
+        if js_state_url:
+            urls.append(js_state_url)
+    except:
+        pass
+    
+    # Method 3: Find URLs in page source
+    page_source = driver.page_source
+    page_urls = re.findall(r'https?://[^"\'\s]*\.m3u8[^"\'\s]*', page_source)
+    urls.extend(page_urls)
+    
+    return urls
+
+def filter_valid_m3u8_url(urls):
+    """Helper function to filter and prioritize valid m3u8 URLs"""
+    if not urls:
+        return None
+    
+    # First priority: Full URLs with parameters
+    for url in urls:
+        if isinstance(url, str) and 'playback.live-video.net' in url and 'm3u8' in url:
+            if 'browser_family=' in url or 'player_version=' in url or 'token=' in url:
+                return url
+    
+    # Second priority: Any URL with playback.live-video.net
+    for url in urls:
+        if isinstance(url, str) and 'playback.live-video.net' in url and 'm3u8' in url:
+            return url
+    
+    return None
+
+def extract_m3u8(channel_name, gui_callback=None, headless=False):
+    """Main function to extract m3u8 URLs from Kick.com"""
+    # Create a log string to store all the detailed logs
+    detailed_log = []
+    
+    def log(message):
+        detailed_log.append(message)
+    
+    # Only print the essential information to the console
+    print(f"Starting extraction for channel: {channel_name}")
+    log(f"Starting extraction for channel: {channel_name}")
+    
+    if gui_callback:
+        gui_callback(f"Extracting stream for {channel_name}...")
+    
+    options = webdriver.ChromeOptions()
+    # Set up a stealthy browser
+    options.add_argument('--disable-blink-features=AutomationControlled')
+    options.add_experimental_option('excludeSwitches', ['enable-automation'])
+    options.add_experimental_option('useAutomationExtension', False)
+    
+    if not headless:
+        options.add_argument('--start-maximized')
+    else:
+        # Headless mode settings (Note: more likely to trigger Cloudflare)
+        options.add_argument('--headless=new')
+        options.add_argument('--disable-gpu')
+        options.add_argument('--window-size=1920,1080')
+    
+    print("Initializing Chrome...")
+    log("Initializing Chrome...")
+    
+    if gui_callback:
+        gui_callback("Opening Chrome browser...")
+    
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    
+    try:
+        # Disguise webdriver
+        driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+        
+        # Visit the channel
+        url = f"https://kick.com/{channel_name}"
+        print(f"Opening {url}...")
+        log(f"Opening {url}...")
+        
+        if gui_callback:
+            gui_callback(f"Navigating to {channel_name}'s stream...")
+        
+        driver.get(url)
+        
+        # Show instruction message for Cloudflare
+        print("If you see a Cloudflare challenge, please solve it manually before continuing.")
+        log("If you see a Cloudflare challenge, please solve it manually before continuing.")
+        
+        if gui_callback:
+            gui_callback("If you see a Cloudflare challenge, please solve it.")
+        
+        # Wait for page to load - critical timeout
+        time.sleep(5)
+        
+        # Check if we still need to handle Cloudflare
+        if "Just a moment" in driver.title or "Cloudflare" in driver.title:
+            log("Cloudflare protection detected. Please solve the challenge manually.")
+            if gui_callback:
+                gui_callback("Please solve the Cloudflare challenge...")
+            
+            # Wait longer for user to solve Cloudflare - critical timeout
+            time.sleep(15)
+        
+        print("Page loaded. Searching for stream URL...")
+        log("Page loaded. Searching for stream URL...")
+        
+        if gui_callback:
+            gui_callback("Page loaded. Searching for stream URL...")
+        
+        # Setup XHR monitoring
+        try:
+            driver.execute_script("""
+                window.m3u8Urls = [];
+                var oldOpen = XMLHttpRequest.prototype.open;
+                XMLHttpRequest.prototype.open = function() {
+                    if (arguments[1] && arguments[1].indexOf('.m3u8') >= 0) {
+                        window.m3u8Urls.push(arguments[1]);
+                    }
+                    return oldOpen.apply(this, arguments);
+                };
+            """)
+        except:
+            log("Error setting up XHR monitoring.")
+        
+        # First attempt: Find URLs in page directly
+        urls = find_m3u8_urls(driver)
+        m3u8_url = filter_valid_m3u8_url(urls)
+        
+        if m3u8_url:
+            log(f"Found stream URL on initial page load: {m3u8_url}")
+        else:
+            # Second attempt: Try interacting with the page
+            log("No stream URL found immediately. Trying to interact with the page...")
+            if gui_callback:
+                gui_callback("No URL found. Trying to interact with stream...")
+            
+            try:
+                # Click video elements and play buttons
+                driver.execute_script("""
+                    // Click on video elements
+                    var videos = document.querySelectorAll('video');
+                    for (var i = 0; i < videos.length; i++) {
+                        try { videos[i].click(); videos[i].play(); } catch(e) {}
+                    }
+                    
+                    // Click on play buttons
+                    var buttons = document.querySelectorAll('button');
+                    for (var i = 0; i < buttons.length; i++) {
+                        var text = buttons[i].textContent || '';
+                        var className = buttons[i].className || '';
+                        if (text.toLowerCase().indexOf('play') >= 0 || className.toLowerCase().indexOf('play') >= 0) {
+                            try { buttons[i].click(); } catch(e) {}
+                        }
+                    }
+                """)
+                
+                # Check for captured XHR URLs
+                captured_urls = driver.execute_script("return window.m3u8Urls || [];")
+                if captured_urls:
+                    m3u8_url = filter_valid_m3u8_url(captured_urls)
+                    
+                # Final check: If still no URL, check all resources
+                if not m3u8_url:
+                    all_resources = driver.execute_script("""
+                        var resources = [];
+                        var entries = performance.getEntries();
+                        for (var i = 0; i < entries.length; i++) {
+                            resources.push(entries[i].name);
+                        }
+                        return resources;
+                    """)
+                    m3u8_url = filter_valid_m3u8_url(all_resources)
+            except Exception as e:
+                log(f"Error during page interaction: {e}")
+        
+        # If a stream URL was found, process it
+        if m3u8_url:
+            if gui_callback:
+                gui_callback(f"Found stream URL!")
+            
+            log("\n" + "=" * 50)
+            log("STREAM URL FOUND:")
+            log(m3u8_url)
+            log("=" * 50 + "\n")
+            
+            # Save logs to file
+            save_log(channel_name, detailed_log)
+            
+            # Create separator before fetching content
+            print("=" * 50)
+            
+            # Process the m3u8 URL
+            return process_m3u8(m3u8_url, channel_name, gui_callback, log_redirect=log)
+        else:
+            # No stream URL found after all attempts
+            log("\nCould not automatically find the stream URL.")
+            log("Try looking for it manually:")
+            log("1. Press F12 to open Developer Tools")
+            log("2. Go to the Network tab")
+            log("3. Type 'm3u8' in the filter box")
+            log("4. Look for entries with 'playback.live-video.net'")
+            
+            # Save logs even if no stream found
+            save_log(channel_name, detailed_log)
+            return None
+    
+    except Exception as e:
+        log(f"Error during extraction: {e}")
+        save_log(channel_name, detailed_log)
+        return None
+    
+    finally:
+        # Ask if user wants to keep the browser open
+        keep_open = messagebox.askyesno("Browser", "Keep browser open?")
+        if not keep_open:
+            driver.quit()
+            log("Browser closed.")
+            print("Browser closed.")
+        else:
+            log("Browser left open. You can close it manually.")
+
+def optimize_m3u8_url(url):
+    """Helper function to optimize m3u8 URL with proper parameters"""
+    # Clean the URL
+    url = url.rstrip('\\')
+    
+    # Add missing parameters if needed
+    if 'browser_family=' not in url and 'token=' in url:
+        try:
+            # Extract base URL and token
+            parts = url.split('?')
+            base_url = parts[0]
+            token_part = ''
+            
+            if len(parts) > 1 and 'token=' in parts[1]:
+                token_params = [p for p in parts[1].split('&') if p.startswith('token=')]
+                if token_params:
+                    token_part = token_params[0].split('token=')[1]
+            
+            # Build the optimized URL
+            return f"{base_url}?browser_family=chrome&browser_version=134.0&cdm=wv&os_name=Windows&os_version=NT%2010.0&platform=web&player_backend=mediaplayer&player_version=1.31.0&supported_codecs=av1,h265,h264&token={token_part}"
+        except:
+            pass
+    
+    return url
+
+def process_m3u8(url, channel_name, gui_callback=None, log_redirect=None):
+    """Process the m3u8 URL to extract the highest quality stream"""
+    # Function to handle logging
+    def log(message):
+        if log_redirect:
+            log_redirect(message)
+        else:
+            # If no log redirect is provided, log to detailed log file
+            with open(f"{channel_name}_detailed.log", "a") as f:
+                f.write(f"{message}\n")
+    
+    print("Fetching stream content...")
+    log(f"Fetching stream content...")
+    if gui_callback:
+        gui_callback(f"Fetching stream content...")
+    
+    # Optimize URL
+    optimized_url = optimize_m3u8_url(url)
+    if optimized_url != url:
+        print("Added missing parameters to URL")
+        log(f"Added missing parameters to URL")
+        url = optimized_url
+    
+    # Optimized headers
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+        'Accept': '*/*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Origin': 'https://kick.com',
+        'Referer': 'https://kick.com/'
+    }
+    
+    # Use a session for better performance
+    session = requests.Session()
+    
+    try:
+        # Fetch the m3u8 content
+        response = session.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            content = response.text
+            print("Successfully retrieved M3U8 content")
+            log("Successfully retrieved M3U8 content")
+            
+            # Save master playlist
+            master_filename = f"{channel_name}_master.m3u8"
+            with open(master_filename, 'w') as f:
+                f.write(content)
+            print(f"Master playlist saved to {master_filename}")
+            log(f"Master playlist saved to {master_filename}")
+            if gui_callback:
+                gui_callback(f"Playlist saved to {master_filename}")
+            
+            # Save full content to a text file
+            full_content_filename = f"{channel_name}_master_full.txt"
+            with open(full_content_filename, 'w') as f:
+                f.write(content)
+            
+            # Extract the highest quality variant
+            highest_quality_url = extract_highest_quality(content, url, session, headers, channel_name, log, gui_callback)
+            
+            # Print just the highest quality URL for streaming
+            print("Full M3U8 content saved to " + full_content_filename)
+            log("Full M3U8 content saved to " + full_content_filename)
+            print("=" * 50)
+            if highest_quality_url:
+                print(highest_quality_url)
+            else:
+                print(url)  # Use the original URL if no variant found
+            print("=" * 50)
+            
+            # Return the highest quality URL or the original URL
+            return highest_quality_url or url
+                
+        else:
+            log(f"Failed to retrieve content. Status code: {response.status_code}")
+            if gui_callback:
+                gui_callback(f"Failed to retrieve content (HTTP {response.status_code})")
+            
+            # Try simplified URL as a fallback
+            if 'browser_family=' in url:
+                simplified_url = try_simplified_url(url, session, headers, channel_name, log, gui_callback)
+                if simplified_url:
+                    return simplified_url
+            
+            return None  # Return None on failure
+    
+    except Exception as e:
+        log(f"An error occurred while fetching the m3u8: {e}")
+        if gui_callback:
+            gui_callback(f"Error: {str(e)}")
+        return None  # Return None on error
+
+def extract_highest_quality(content, base_url, session, headers, channel_name, log, gui_callback):
+    """Extract the highest quality variant from m3u8 content"""
+    highest_quality_url = None
+    
+    if "#EXT-X-STREAM-INF" in content:
+        print("Found master playlist with quality variants")
+        log("Found master playlist with quality variants")
+        
+        # Extract variants
+        variant_info = []
+        lines = content.splitlines()
+        for i, line in enumerate(lines):
+            if line.startswith('#EXT-X-STREAM-INF'):
+                # Extract bandwidth and resolution
+                bandwidth = 0
+                resolution = "unknown"
+                
+                if "BANDWIDTH=" in line:
+                    bandwidth_str = line.split("BANDWIDTH=")[1].split(",")[0].split(" ")[0]
+                    try:
+                        bandwidth = int(bandwidth_str)
+                    except ValueError:
+                        pass
+                
+                if "RESOLUTION=" in line:
+                    resolution = line.split("RESOLUTION=")[1].split(",")[0].split(" ")[0]
+                
+                # Get the URL from the next line
+                if i + 1 < len(lines) and not lines[i+1].startswith('#'):
+                    variant_url = lines[i+1].strip()
+                    
+                    # Handle relative URLs
+                    if not variant_url.startswith('http'):
+                        base_path = '/'.join(base_url.split('/')[:-1]) + '/'
+                        variant_url = requests.compat.urljoin(base_path, variant_url)
+                    
+                    variant_info.append((bandwidth, resolution, variant_url))
+        
+        # Sort by bandwidth (highest quality first)
+        variant_info.sort(key=lambda x: x[0], reverse=True)
+        
+        if variant_info:
+            # Get the highest quality variant
+            best_variant = variant_info[0][2]
+            highest_quality_url = best_variant
+            print(f"Selected highest quality: {variant_info[0][1]}")
+            log(f"Selected highest quality: {variant_info[0][1]}")
+            if gui_callback:
+                gui_callback(f"Selected highest quality: {variant_info[0][1]}")
+            
+            # Download the variant playlist
+            try:
+                variant_response = session.get(best_variant, headers=headers, timeout=10)
+                if variant_response.status_code == 200:
+                    variant_content = variant_response.text
+                    variant_filename = f"{channel_name}_best_quality.m3u8"
+                    
+                    with open(variant_filename, 'w') as f:
+                        f.write(variant_content)
+                    print(f"Best quality variant saved to {variant_filename}")
+                    log(f"Best quality variant saved to {variant_filename}")
+                    if gui_callback:
+                        gui_callback(f"Best quality variant saved to {variant_filename}")
+                else:
+                    log(f"Failed to retrieve variant playlist: {variant_response.status_code}")
+            except Exception as e:
+                log(f"Error saving variant playlist: {e}")
+    else:
+        log("This appears to be a media playlist with segments")
+    
+    return highest_quality_url
+
+def try_simplified_url(url, session, headers, channel_name, log, gui_callback):
+    """Try a simplified URL as fallback"""
+    log("Trying simplified URL...")
+    if gui_callback:
+        gui_callback("Trying simplified URL...")
+    
+    try:
+        parts = url.split('?')
+        base_url = parts[0]
+        token_part = ''
+        
+        if len(parts) > 1 and 'token=' in parts[1]:
+            token_params = [p for p in parts[1].split('&') if p.startswith('token=')]
+            if token_params:
+                token_part = token_params[0].split('token=')[1].split('&')[0]
+        
+        simplified_url = f"{base_url}?token={token_part}"
+        
+        response = session.get(simplified_url, headers=headers, timeout=10)
+        if response.status_code == 200:
+            content = response.text
+            log("Success with simplified URL!")
+            if gui_callback:
+                gui_callback("Success with simplified URL!")
+            
+            # Save the playlist
+            master_filename = f"{channel_name}_master.m3u8"
+            with open(master_filename, 'w') as f:
+                f.write(content)
+            log(f"Master playlist saved to {master_filename}")
+            if gui_callback:
+                gui_callback(f"Playlist saved to {master_filename}")
+            
+            return simplified_url
+        else:
+            log(f"Simplified URL also failed. Status code: {response.status_code}")
+            return None
+    except Exception as e:
+        log(f"Error with simplified URL: {e}")
+        return None
+
+# Main script
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = KickStreamerApp(root)
+    root.mainloop()

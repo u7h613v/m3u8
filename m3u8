@@ -11,6 +11,9 @@ import requests
 import os
 import io
 import sys
+import subprocess
+import platform
+from urllib.parse import urljoin
 
 # Redirect stdout to capture print statements
 class TextRedirector:
@@ -78,6 +81,7 @@ class KickStreamerApp:
         self.m3u8_url = None
         self.master_filename = None
         self.is_extracting = False
+        self.driver = None
         
         # Redirect stdout to the text widget
         self.old_stdout = sys.stdout
@@ -95,6 +99,11 @@ class KickStreamerApp:
         if not channel_name:
             messagebox.showerror("Error", "Please enter a channel name.")
             return
+        
+        # Validate channel name for filesystem safety
+        if not self.is_valid_filename(channel_name):
+            messagebox.showerror("Error", "Channel name contains invalid characters.")
+            return
             
         self.is_extracting = True
         self.extract_button.config(state="disabled")
@@ -104,6 +113,12 @@ class KickStreamerApp:
         
         # Run the extraction in a separate thread to keep the GUI responsive
         threading.Thread(target=self.extract_stream, args=(channel_name,), daemon=True).start()
+    
+    def is_valid_filename(self, filename):
+        """Check if the filename is valid and doesn't contain dangerous characters"""
+        # Simple check for basic invalid characters
+        invalid_chars = ['/', '\\', ':', '*', '?', '"', '<', '>', '|', ';', '&', '$']
+        return not any(char in filename for char in invalid_chars)
     
     def extract_stream(self, channel_name):
         # Clear the log before starting
@@ -130,10 +145,19 @@ class KickStreamerApp:
     def set_extracted_url(self, url, channel_name):
         """Update the URL and related GUI elements in a thread-safe way"""
         self.m3u8_url = url
-        self.master_filename = f"{channel_name}_master.m3u8"
+        # Sanitize the filename
+        safe_channel_name = self.sanitize_filename(channel_name)
+        self.master_filename = f"{safe_channel_name}_master.m3u8"
         self.status_var.set(f"Stream extracted successfully: {self.master_filename}")
         self.extract_button.config(state="normal")
         self.vlc_button.config(state="normal")
+    
+    def sanitize_filename(self, filename):
+        """Create a safe filename by removing or replacing unsafe characters"""
+        # Replace unsafe characters with underscores
+        for char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|', ';', '&', '$']:
+            filename = filename.replace(char, '_')
+        return filename
     
     def update_status(self, message):
         self.status_var.set(message)
@@ -149,8 +173,13 @@ class KickStreamerApp:
                 file_path = os.path.abspath(self.master_filename)
                 print(f"Opening {file_path} in VLC...")
                 
-                # Try to open with VLC
-                os.system(f'start vlc "{file_path}"')
+                # Fixed version: use subprocess.run with shell=False and platform detection
+                if platform.system() == "Windows":
+                    subprocess.run(["vlc", file_path], shell=False, check=False)
+                elif platform.system() == "Darwin":  # macOS
+                    subprocess.run(["open", "-a", "VLC", file_path], shell=False, check=False)
+                else:  # Linux and others
+                    subprocess.run(["vlc", file_path], shell=False, check=False)
             else:
                 print(f"File {self.master_filename} not found")
                 messagebox.showerror("Error", f"File {self.master_filename} not found")
@@ -162,12 +191,22 @@ class KickStreamerApp:
     def on_closing(self):
         # Restore stdout
         sys.stdout = self.old_stdout
+        
+        # Safely close any browser instances
+        if self.driver:
+            try:
+                self.driver.quit()
+            except:
+                pass
+            
         self.root.destroy()
 
 def save_log(channel_name, log_data):
     """Helper function to save log data to a file"""
-    log_file_path = f"{channel_name}_extraction_log.txt"
-    with open(log_file_path, 'w') as f:
+    # Sanitize filename
+    safe_channel_name = ''.join(c if c.isalnum() or c in ['-', '_'] else '_' for c in channel_name)
+    log_file_path = f"{safe_channel_name}_extraction_log.txt"
+    with open(log_file_path, 'w', encoding='utf-8') as f:
         f.write("\n".join(log_data))
 
 def find_m3u8_urls(driver):
@@ -188,7 +227,7 @@ def find_m3u8_urls(driver):
             return result;
         """)
         urls.extend(network_urls)
-    except:
+    except Exception:
         pass
     
     # Method 2: Check KICK_PRELOADED_STATE
@@ -205,7 +244,7 @@ def find_m3u8_urls(driver):
         """)
         if js_state_url:
             urls.append(js_state_url)
-    except:
+    except Exception:
         pass
     
     # Method 3: Find URLs in page source
@@ -237,6 +276,7 @@ def extract_m3u8(channel_name, gui_callback=None, headless=False):
     """Main function to extract m3u8 URLs from Kick.com"""
     # Create a log string to store all the detailed logs
     detailed_log = []
+    driver = None
     
     def log(message):
         detailed_log.append(message)
@@ -268,13 +308,13 @@ def extract_m3u8(channel_name, gui_callback=None, headless=False):
     if gui_callback:
         gui_callback("Opening Chrome browser...")
     
-    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
-    
     try:
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+        
         # Disguise webdriver
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
-        # Visit the channel
+        # Visit the channel - Ensure URL is properly constructed
         url = f"https://kick.com/{channel_name}"
         print(f"Opening {url}...")
         log(f"Opening {url}...")
@@ -321,7 +361,7 @@ def extract_m3u8(channel_name, gui_callback=None, headless=False):
                     return oldOpen.apply(this, arguments);
                 };
             """)
-        except:
+        except Exception:
             log("Error setting up XHR monitoring.")
         
         # First attempt: Find URLs in page directly
@@ -385,14 +425,17 @@ def extract_m3u8(channel_name, gui_callback=None, headless=False):
             log(m3u8_url)
             log("=" * 50 + "\n")
             
+            # Sanitize channel name for file operations
+            safe_channel_name = ''.join(c if c.isalnum() or c in ['-', '_'] else '_' for c in channel_name)
+            
             # Save logs to file
-            save_log(channel_name, detailed_log)
+            save_log(safe_channel_name, detailed_log)
             
             # Create separator before fetching content
             print("=" * 50)
             
             # Process the m3u8 URL
-            return process_m3u8(m3u8_url, channel_name, gui_callback, log_redirect=log)
+            return process_m3u8(m3u8_url, safe_channel_name, gui_callback, log_redirect=log)
         else:
             # No stream URL found after all attempts
             log("\nCould not automatically find the stream URL.")
@@ -414,7 +457,7 @@ def extract_m3u8(channel_name, gui_callback=None, headless=False):
     finally:
         # Ask if user wants to keep the browser open
         keep_open = messagebox.askyesno("Browser", "Keep browser open?")
-        if not keep_open:
+        if not keep_open and driver:
             driver.quit()
             log("Browser closed.")
             print("Browser closed.")
@@ -441,7 +484,7 @@ def optimize_m3u8_url(url):
             
             # Build the optimized URL
             return f"{base_url}?browser_family=chrome&browser_version=134.0&cdm=wv&os_name=Windows&os_version=NT%2010.0&platform=web&player_backend=mediaplayer&player_version=1.31.0&supported_codecs=av1,h265,h264&token={token_part}"
-        except:
+        except Exception:
             pass
     
     return url
@@ -454,7 +497,7 @@ def process_m3u8(url, channel_name, gui_callback=None, log_redirect=None):
             log_redirect(message)
         else:
             # If no log redirect is provided, log to detailed log file
-            with open(f"{channel_name}_detailed.log", "a") as f:
+            with open(f"{channel_name}_detailed.log", "a", encoding='utf-8') as f:
                 f.write(f"{message}\n")
     
     print("Fetching stream content...")
@@ -482,8 +525,8 @@ def process_m3u8(url, channel_name, gui_callback=None, log_redirect=None):
     session = requests.Session()
     
     try:
-        # Fetch the m3u8 content
-        response = session.get(url, headers=headers, timeout=10)
+        # Fetch the m3u8 content with SSL verification
+        response = session.get(url, headers=headers, timeout=10, verify=True)
         
         if response.status_code == 200:
             content = response.text
@@ -492,7 +535,7 @@ def process_m3u8(url, channel_name, gui_callback=None, log_redirect=None):
             
             # Save master playlist
             master_filename = f"{channel_name}_master.m3u8"
-            with open(master_filename, 'w') as f:
+            with open(master_filename, 'w', encoding='utf-8') as f:
                 f.write(content)
             print(f"Master playlist saved to {master_filename}")
             log(f"Master playlist saved to {master_filename}")
@@ -501,7 +544,7 @@ def process_m3u8(url, channel_name, gui_callback=None, log_redirect=None):
             
             # Save full content to a text file
             full_content_filename = f"{channel_name}_master_full.txt"
-            with open(full_content_filename, 'w') as f:
+            with open(full_content_filename, 'w', encoding='utf-8') as f:
                 f.write(content)
             
             # Extract the highest quality variant
@@ -570,10 +613,13 @@ def extract_highest_quality(content, base_url, session, headers, channel_name, l
                 if i + 1 < len(lines) and not lines[i+1].startswith('#'):
                     variant_url = lines[i+1].strip()
                     
-                    # Handle relative URLs
+                    # Handle relative URLs securely
                     if not variant_url.startswith('http'):
-                        base_path = '/'.join(base_url.split('/')[:-1]) + '/'
-                        variant_url = requests.compat.urljoin(base_path, variant_url)
+                        base_parts = base_url.split('/')
+                        if base_parts[-1].endswith('.m3u8'):
+                            base_parts.pop()  # Remove the filename
+                        base_path = '/'.join(base_parts) + '/'
+                        variant_url = urljoin(base_path, variant_url)
                     
                     variant_info.append((bandwidth, resolution, variant_url))
         
@@ -591,12 +637,12 @@ def extract_highest_quality(content, base_url, session, headers, channel_name, l
             
             # Download the variant playlist
             try:
-                variant_response = session.get(best_variant, headers=headers, timeout=10)
+                variant_response = session.get(best_variant, headers=headers, timeout=10, verify=True)
                 if variant_response.status_code == 200:
                     variant_content = variant_response.text
                     variant_filename = f"{channel_name}_best_quality.m3u8"
                     
-                    with open(variant_filename, 'w') as f:
+                    with open(variant_filename, 'w', encoding='utf-8') as f:
                         f.write(variant_content)
                     print(f"Best quality variant saved to {variant_filename}")
                     log(f"Best quality variant saved to {variant_filename}")
@@ -629,7 +675,7 @@ def try_simplified_url(url, session, headers, channel_name, log, gui_callback):
         
         simplified_url = f"{base_url}?token={token_part}"
         
-        response = session.get(simplified_url, headers=headers, timeout=10)
+        response = session.get(simplified_url, headers=headers, timeout=10, verify=True)
         if response.status_code == 200:
             content = response.text
             log("Success with simplified URL!")
@@ -638,7 +684,7 @@ def try_simplified_url(url, session, headers, channel_name, log, gui_callback):
             
             # Save the playlist
             master_filename = f"{channel_name}_master.m3u8"
-            with open(master_filename, 'w') as f:
+            with open(master_filename, 'w', encoding='utf-8') as f:
                 f.write(content)
             log(f"Master playlist saved to {master_filename}")
             if gui_callback:
